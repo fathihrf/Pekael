@@ -78,19 +78,53 @@ def extract_templates(annotations):
     return templates
 
 def preprocess_for_ocr(img_roi):
-    # PaddleOCR works best on natural images, but upscaling helps small text.
-    scale = 2 
+    # PaddleOCR works best on natural images, but for 7-segment, we often need to "connect" the dots.
+    # 1. Upscale
+    candidate_list = []
+
+    # Candidate 1: Natural @ 2x Scale (Best for Humidity/Solid Text)
+    scale_low = 2
     h, w = img_roi.shape[:2]
-    upscaled = cv2.resize(img_roi, (w*scale, h*scale), interpolation=cv2.INTER_CUBIC)
+    upscaled_low = cv2.resize(img_roi, (w*scale_low, h*scale_low), interpolation=cv2.INTER_CUBIC)
     
-    # Add whitespace padding
-    # PaddleOCR needs some margin
-    processed = cv2.copyMakeBorder(upscaled, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=[127, 127, 127]) 
-    # value=127 (gray) padding might be safer than white/black if we don't know background.
-    # But usually matching background is best.
-    # Let's try simple padding.
+    cand1 = cv2.copyMakeBorder(upscaled_low, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=[127, 127, 127])
+    # Ensure BGR
+    if len(cand1.shape) == 2:
+        cand1 = cv2.cvtColor(cand1, cv2.COLOR_GRAY2BGR)
     
-    return processed
+    candidate_list.append(cand1)
+
+    # Candidate 2: Binary + Dilated @ 4x Scale (Best for 7-Segment Temperature)
+    scale_high = 4
+    upscaled_high = cv2.resize(img_roi, (w*scale_high, h*scale_high), interpolation=cv2.INTER_CUBIC)
+    
+    if len(upscaled_high.shape) == 3:
+         gray = cv2.cvtColor(upscaled_high, cv2.COLOR_BGR2GRAY)
+    else:
+         gray = upscaled_high
+         
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # Normalize to White Text on Black
+    h, w = thresh.shape
+    corners = [thresh[0,0], thresh[0,w-1], thresh[h-1,0], thresh[h-1,w-1]]
+    if np.mean(corners) > 127: 
+        thresh = cv2.bitwise_not(thresh)
+        
+    # Dilate White Text
+    kernel = np.ones((3,3), np.uint8)
+    processed = cv2.dilate(thresh, kernel, iterations=1)
+    
+    # Invert back to Black on White
+    processed = cv2.bitwise_not(processed)
+    
+    # Pad
+    processed = cv2.copyMakeBorder(processed, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=[255, 255, 255]) 
+    cand2 = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
+    
+    candidate_list.append(cand2)
+    
+    return candidate_list
 
 def process_test_images(templates, annotations, reader):
     test_images = glob.glob(os.path.join(TEST_DIR, "*"))
@@ -129,27 +163,32 @@ def process_test_images(templates, annotations, reader):
             cv2.rectangle(img, (pred_box[0], pred_box[1]), (pred_box[0]+w, pred_box[1]+h), (0, 0, 255), 2)
             
             # --- OCR Section ---
-            # Crop the detected region
-            roi_x, roi_y, roi_w, roi_h = pred_box
-            # Ensure boundaries
-            roi_y = max(0, roi_y)
-            roi_x = max(0, roi_x)
-            roi_img = img[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
+            # Strategy: 
+            # 1. Try Original ROI (Good for isolated text like Humidity)
+            # 2. Try Expanded ROI (Good for truncated text like Temperature "2" -> "24.3")
             
-            if roi_img.size > 0:
-                # Preprocess
-                processed_roi = preprocess_for_ocr(roi_img)
-                
-                # Debug: save processed roi
-                # cv2.imwrite(f"debug_{label}_{filename}", processed_roi)
-                
-                # Read text
-                # distinct from EasyOCR: PaddleOCR doesn't have a built-in allowlist param in the main call often, 
-                # but we filter with regex anyway.
-                # processed_roi is already BGR now (from revised preprocess)
-                result = reader.ocr(processed_roi)
-                
-                detected_text = ""
+            # Original coords
+            x1, y1, w1, h1 = pred_box
+            x1 = max(0, x1)
+            y1 = max(0, y1)
+            roi_img_orig = img[y1:y1+h1, x1:x1+w1]
+            
+            # Expanded coords
+            expand_w = int(w1 * 0.2)
+            expand_h = int(h1 * 0.1)
+            x2 = max(0, x1 - expand_w)
+            y2 = max(0, y1 - expand_h)
+            w2 = min(img.shape[1] - x2, w1 + 2 * expand_w)
+            h2 = min(img.shape[0] - y2, h1 + 2 * expand_h)
+            roi_img_exp = img[y2:y2+h2, x2:x2+w2]
+            
+            candidates = []
+            if roi_img_orig.size > 0:
+                 candidates.extend(preprocess_for_ocr(roi_img_orig))
+            if roi_img_exp.size > 0:
+                 candidates.extend(preprocess_for_ocr(roi_img_exp))
+            
+            if candidates:
                 
                 # Helper to parse result
                 def parse_ocr_result(res):
@@ -185,15 +224,28 @@ def process_test_images(templates, annotations, reader):
                                          text_out += cleaned
                      return text_out
 
-                detected_text = parse_ocr_result(result)
-
-                if not detected_text:
-                    inverted_roi = cv2.bitwise_not(processed_roi)
-                    # processed_roi is BGR, so inverted is BGR.
-                    result_inv = reader.ocr(inverted_roi)
-                    detected_text = parse_ocr_result(result_inv)
+                # Try each candidate and pick the longest
+                best_text = ""
                 
-                print(f"  [{label}] Detected Value: {detected_text}")
+                for i, img_cand in enumerate(candidates):
+                    # Debug
+                    # print(f"    [Debug] Trying Candidate {i}")
+                    result = reader.ocr(img_cand)
+                    detected_text = parse_ocr_result(result)
+                    # print(f"    [Debug] Candidate {i}: '{detected_text}'")
+                    
+                    if len(detected_text) > len(best_text):
+                        best_text = detected_text
+                
+                final_text = best_text
+                
+                # If still empty, try inverted of the Natural candidate (index 0)
+                if not final_text:
+                    inverted_roi = cv2.bitwise_not(candidates[0])
+                    result_inv = reader.ocr(inverted_roi)
+                    final_text = parse_ocr_result(result_inv)
+                
+                print(f"  [{label}] Detected Value: {final_text}")
             # -------------------
             
             # Evaluate if GT exists
