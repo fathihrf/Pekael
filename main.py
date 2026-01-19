@@ -126,10 +126,115 @@ def preprocess_for_ocr(img_roi):
     
     return candidate_list
 
+def analyze_image(img, templates, reader, ground_truth=None):
+    """
+    Analyzes a single image using the provided templates and OCR reader.
+    Returns:
+        processed_img: The image with annotations drawn.
+        results: A dictionary of detected values {label: {'value': str, 'score': float, 'box': list}}.
+    """
+    results = {}
+    
+    for label, template in templates.items():
+        # Template Match
+        res = cv2.matchTemplate(img, template, cv2.TM_CCOEFF_NORMED)
+        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+        
+        # Predict Box
+        h, w = template.shape[:2]
+        top_left = max_loc
+        pred_box = [top_left[0], top_left[1], w, h]
+        
+        score = max_val
+        
+        # Draw Prediction (Red)
+        cv2.rectangle(img, (pred_box[0], pred_box[1]), (pred_box[0]+w, pred_box[1]+h), (0, 0, 255), 2)
+        
+        # --- OCR Section ---
+        x1, y1, w1, h1 = pred_box
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        roi_img_orig = img[y1:y1+h1, x1:x1+w1]
+        
+        # Expanded coords
+        expand_w = int(w1 * 0.2)
+        expand_h = int(h1 * 0.1)
+        x2 = max(0, x1 - expand_w)
+        y2 = max(0, y1 - expand_h)
+        w2 = min(img.shape[1] - x2, w1 + 2 * expand_w)
+        h2 = min(img.shape[0] - y2, h1 + 2 * expand_h)
+        roi_img_exp = img[y2:y2+h2, x2:x2+w2]
+        
+        candidates = []
+        if roi_img_orig.size > 0:
+             candidates.extend(preprocess_for_ocr(roi_img_orig))
+        if roi_img_exp.size > 0:
+             candidates.extend(preprocess_for_ocr(roi_img_exp))
+        
+        final_text = ""
+        if candidates:
+            # Helper to parse result
+            def parse_ocr_result(res):
+                 text_out = ""
+                 if not res: return text_out
+                 
+                 # Check for new Dictionary format (PaddleOCR 3.x / PaddleX)
+                 if isinstance(res, list) and len(res) > 0 and isinstance(res[0], dict):
+                     for item in res:
+                         texts = item.get('rec_texts', [])
+                         for text in texts:
+                             cleaned = re.sub(r'[^0-9.]', '', text)
+                             text_out += cleaned
+                     return text_out
+                 
+                 # Fallback to list of lines format
+                 for line in res:
+                     if isinstance(line, list):
+                        if len(line) > 0 and isinstance(line[0], list) and len(line[0]) == 4 and isinstance(line[0][0], list):
+                            text = line[1][0]
+                            cleaned = re.sub(r'[^0-9.]', '', text)
+                            text_out += cleaned
+                        else:
+                            for subline in line:
+                                if isinstance(subline, list) and len(subline) >= 2:
+                                     text = subline[1][0]
+                                     cleaned = re.sub(r'[^0-9.]', '', text)
+                                     text_out += cleaned
+                 return text_out
+
+            best_text = ""
+            for i, img_cand in enumerate(candidates):
+                result = reader.ocr(img_cand)
+                detected_text = parse_ocr_result(result)
+                if len(detected_text) > len(best_text):
+                    best_text = detected_text
+            
+            final_text = best_text
+            
+            # If still empty, try inverted of the Natural candidate (index 0)
+            if not final_text and len(candidates) > 0:
+                inverted_roi = cv2.bitwise_not(candidates[0])
+                result_inv = reader.ocr(inverted_roi)
+                final_text = parse_ocr_result(result_inv)
+            
+        results[label] = {
+            'value': final_text,
+            'score': score,
+            'box': pred_box
+        }
+
+        # Evaluate if GT exists
+        if ground_truth and label in ground_truth:
+            gt_box = ground_truth[label]
+            iou_val = iou(pred_box, gt_box)
+            # Draw GT (Green)
+            cv2.rectangle(img, (gt_box[0], gt_box[1]), (gt_box[0]+gt_box[2], gt_box[1]+gt_box[3]), (0, 255, 0), 2)
+            results[label]['iou'] = iou_val
+
+    return img, results
+
 def process_test_images(templates, annotations, reader):
     test_images = glob.glob(os.path.join(TEST_DIR, "*"))
-    
-    results = []
     
     print("\n--- Testing ---")
     for img_path in test_images:
@@ -141,127 +246,19 @@ def process_test_images(templates, annotations, reader):
         
         print(f"\nImage: {filename}")
         
-        for label, template in templates.items():
-            # Template Match
-            # We use TM_CCOEFF_NORMED
-            
-            # Note: Ideally convert to gray, but for colored objects, color matching helps too.
-            # Let's try simple BGR matching first (works fine with matchTemplate)
-            
-            res = cv2.matchTemplate(img, template, cv2.TM_CCOEFF_NORMED)
-            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
-            
-            # Predict Box
-            h, w = template.shape[:2]
-            top_left = max_loc
-            pred_box = [top_left[0], top_left[1], w, h]
-            
-            score = max_val
-            print(f"  [{label}] Match Score: {score:.4f}")
-            
-            # Draw Prediction (Red)
-            cv2.rectangle(img, (pred_box[0], pred_box[1]), (pred_box[0]+w, pred_box[1]+h), (0, 0, 255), 2)
-            
-            # --- OCR Section ---
-            # Strategy: 
-            # 1. Try Original ROI (Good for isolated text like Humidity)
-            # 2. Try Expanded ROI (Good for truncated text like Temperature "2" -> "24.3")
-            
-            # Original coords
-            x1, y1, w1, h1 = pred_box
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            roi_img_orig = img[y1:y1+h1, x1:x1+w1]
-            
-            # Expanded coords
-            expand_w = int(w1 * 0.2)
-            expand_h = int(h1 * 0.1)
-            x2 = max(0, x1 - expand_w)
-            y2 = max(0, y1 - expand_h)
-            w2 = min(img.shape[1] - x2, w1 + 2 * expand_w)
-            h2 = min(img.shape[0] - y2, h1 + 2 * expand_h)
-            roi_img_exp = img[y2:y2+h2, x2:x2+w2]
-            
-            candidates = []
-            if roi_img_orig.size > 0:
-                 candidates.extend(preprocess_for_ocr(roi_img_orig))
-            if roi_img_exp.size > 0:
-                 candidates.extend(preprocess_for_ocr(roi_img_exp))
-            
-            if candidates:
-                
-                # Helper to parse result
-                def parse_ocr_result(res):
-                     text_out = ""
-                     if not res: return text_out
-                     
-                     # Check for new Dictionary format (PaddleOCR 3.x / PaddleX)
-                     if isinstance(res, list) and len(res) > 0 and isinstance(res[0], dict):
-                         # format: [{'rec_texts': [...], 'rec_scores': [...], ...}]
-                         for item in res:
-                             texts = item.get('rec_texts', [])
-                             for text in texts:
-                                 cleaned = re.sub(r'[^0-9.]', '', text)
-                                 text_out += cleaned
-                         return text_out
-                     
-                     # Fallback to list of lines format
-                     for line in res:
-                         if isinstance(line, list):
-                            # line could be [[box], [text, score]] OR a list of such lines
-                            # Deep check
-                            if len(line) > 0 and isinstance(line[0], list) and len(line[0]) == 4 and isinstance(line[0][0], list):
-                                # line IS a single result: [[box], [text, score]]
-                                text = line[1][0]
-                                cleaned = re.sub(r'[^0-9.]', '', text)
-                                text_out += cleaned
-                            else:
-                                # line is a list of results?
-                                for subline in line:
-                                    if isinstance(subline, list) and len(subline) >= 2:
-                                         text = subline[1][0]
-                                         cleaned = re.sub(r'[^0-9.]', '', text)
-                                         text_out += cleaned
-                     return text_out
-
-                # Try each candidate and pick the longest
-                best_text = ""
-                
-                for i, img_cand in enumerate(candidates):
-                    # Debug
-                    # print(f"    [Debug] Trying Candidate {i}")
-                    result = reader.ocr(img_cand)
-                    detected_text = parse_ocr_result(result)
-                    # print(f"    [Debug] Candidate {i}: '{detected_text}'")
-                    
-                    if len(detected_text) > len(best_text):
-                        best_text = detected_text
-                
-                final_text = best_text
-                
-                # If still empty, try inverted of the Natural candidate (index 0)
-                if not final_text:
-                    inverted_roi = cv2.bitwise_not(candidates[0])
-                    result_inv = reader.ocr(inverted_roi)
-                    final_text = parse_ocr_result(result_inv)
-                
-                print(f"  [{label}] Detected Value: {final_text}")
-            # -------------------
-            
-            # Evaluate if GT exists
-            if gt and label in gt:
-                gt_box = gt[label]
-                iou_val = iou(pred_box, gt_box)
-                print(f"  [{label}] IoU: {iou_val:.4f}")
-                
-                 # Draw GT (Green)
-                cv2.rectangle(img, (gt_box[0], gt_box[1]), (gt_box[0]+gt_box[2], gt_box[1]+gt_box[3]), (0, 255, 0), 2)
+        processed_img, results = analyze_image(img, templates, reader, ground_truth=gt)
+        
+        for label, data in results.items():
+            print(f"  [{label}] Match Score: {data['score']:.4f}")
+            print(f"  [{label}] Detected Value: {data['value']}")
+            if 'iou' in data:
+                print(f"  [{label}] IoU: {data['iou']:.4f}")
             else:
                 print(f"  [{label}] No GT found.")
 
         # Save result image
         output_path = f"output_{filename}"
-        cv2.imwrite(output_path, img) 
+        cv2.imwrite(output_path, processed_img) 
         print(f"  Saved result to {output_path}")
 
 def main():
