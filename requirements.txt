@@ -3,3 +3,5 @@ numpy<2
 paddlepaddle
 paddleocr
 PyQt5
+gspread
+oauth2client
