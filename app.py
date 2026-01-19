@@ -6,11 +6,13 @@ from datetime import datetime
 import numpy as np
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QFileDialog, 
-                             QGroupBox, QFormLayout, QScrollArea, QMessageBox)
+                             QGroupBox, QFormLayout, QScrollArea, QMessageBox, QInputDialog)
 from PyQt5 import uic
 from PyQt5.QtGui import QPixmap, QImage
 from PyQt5.QtCore import Qt
 import main as backend
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
 # Start defining the main class based on the UI file
 class HygroScanApp(QMainWindow):
@@ -159,10 +161,36 @@ class HygroScanApp(QMainWindow):
                 image_name = os.path.basename(self.current_image_path)
                 writer.writerow([timestamp, image_name, temp, hum])
                 
-            QMessageBox.information(self, "Saved", f"Data saved to {csv_file}:\nTemperature: {temp}\nHumidity: {hum}")
+            QMessageBox.information(self, "Saved", f"Data saved to {csv_file}")
             
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save to CSV: {str(e)}")
+            
+        # Google Sheets Upload
+        if os.path.exists('credentials.json'):
+             # Prompt for sheet name
+             sheet_name, ok = QInputDialog.getText(self, "Google Cloud", "Enter your Google Sheet Name to upload (Optional):")
+             if ok and sheet_name:
+                 try:
+                     self.lbl_status.setText("Uploading to Drive...")
+                     QApplication.processEvents()
+                     
+                     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+                     creds = ServiceAccountCredentials.from_json_keyfile_name('credentials.json', scope)
+                     client = gspread.authorize(creds)
+                     
+                     # Open Sheet
+                     try:
+                         sheet = client.open(sheet_name).sheet1
+                         sheet.append_row([timestamp, image_name, temp, hum])
+                         QMessageBox.information(self, "Success", "Data uploaded to Google Sheet!")
+                     except gspread.exceptions.SpreadsheetNotFound:
+                          QMessageBox.warning(self, "Error", f"Spreadsheet '{sheet_name}' not found.\nPlease ensure you 'Shared' it with:\n{creds.service_account_email}")
+                          
+                 except Exception as e:
+                     QMessageBox.warning(self, "Google Sheets Error", str(e))
+                 finally:
+                     self.lbl_status.setText("Ready.")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
